@@ -9,20 +9,32 @@ import (
 	"time"
 )
 
-func NewUrlDownloader(out int, timeout time.Duration) UrlDownloader {
+func NewUrlDownloader(out uint, timeout time.Duration) UrlDownloader {
 	d := &Downloader{
 		requestTimeout: timeout,
-		workers:        make([]chan downloaderRequest, out, out),
-	}
-
-	for k := range d.workers {
-		w := make(chan downloaderRequest)
-		d.workers[k] = w
-
-		go d.worker(w)
+		maxWorkers:     out,
 	}
 
 	return d
+}
+
+func (d Downloader) Download(ctx context.Context, urls []string) ([]DownloaderResponse, error) {
+	newCtx, cancel := context.WithCancel(ctx)
+	resp := make(chan DownloaderResponse)
+	defer func() {
+		close(resp)
+	}()
+
+	expectedURLs := len(urls)
+
+	go d.queueURLs(newCtx, urls, resp)
+
+	data, err := d.responseWaiter(newCtx, cancel, expectedURLs, resp)
+	if err != nil {
+		return nil, err
+	}
+
+	return data, nil
 }
 
 type downloaderRequest struct {
@@ -33,7 +45,7 @@ type downloaderRequest struct {
 
 type Downloader struct {
 	requestTimeout time.Duration
-	workers        []chan downloaderRequest
+	maxWorkers     uint
 }
 
 type DownloaderResponse struct {
@@ -118,6 +130,12 @@ func (d Downloader) worker(dr <-chan downloaderRequest) {
 	}
 }
 
+func (d Downloader) closeChannels(dt []chan downloaderRequest) {
+	for _, v := range dt {
+		close(v)
+	}
+}
+
 func (d Downloader) queueURLs(ctx context.Context, urls []string, out chan<- DownloaderResponse) {
 	var (
 		head       = len(urls) - 1
@@ -128,10 +146,21 @@ func (d Downloader) queueURLs(ctx context.Context, urls []string, out chan<- Dow
 		}
 	)
 
+	workers := make([]chan downloaderRequest, d.maxWorkers)
+
+	var i uint
+	for i = 0; i < d.maxWorkers; i++ {
+		workers[i] = make(chan downloaderRequest)
+
+		go d.worker(workers[i])
+	}
+
 	for {
-		for _, v := range d.workers {
+		for _, v := range workers {
 			select {
 			case <-ctx.Done():
+				d.closeChannels(workers)
+
 				return
 			default:
 			}
@@ -141,6 +170,8 @@ func (d Downloader) queueURLs(ctx context.Context, urls []string, out chan<- Dow
 				head--
 
 				if head == -1 {
+					d.closeChannels(workers)
+
 					return
 				}
 
@@ -178,23 +209,4 @@ func (d *Downloader) responseWaiter(ctx context.Context, cancel context.CancelFu
 			}
 		}
 	}
-}
-
-func (d Downloader) Download(ctx context.Context, urls []string) ([]DownloaderResponse, error) {
-	newCtx, cancel := context.WithCancel(ctx)
-	resp := make(chan DownloaderResponse)
-	defer func() {
-		close(resp)
-	}()
-
-	expectedURLs := len(urls)
-
-	go d.queueURLs(newCtx, urls, resp)
-
-	data, err := d.responseWaiter(newCtx, cancel, expectedURLs, resp)
-	if err != nil {
-		return nil, err
-	}
-
-	return data, nil
 }
